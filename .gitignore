@@ -1,0 +1,12 @@
+.claude/vendor/
+.claude/skills/kicad
+.claude/skills/emc
+.claude/skills/spice
+.claude/skills/datasheets
+.claude/skills/bom
+.claude/skills/lcsc
+.claude/skills/jlcpcb
+.claude/skills/pcbway
+
+# macOS
+.DS_Store
