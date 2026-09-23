@@ -18,6 +18,7 @@ set -uo pipefail
 
 # ── 配置 ────────────────────────────────────────────────────────────────────
 KICAD_HAPPY_REPO="https://github.com/aklofas/kicad-happy.git"
+KICAD_AUTHOR_REPO="${KICAD_AUTHOR_REPO:-https://github.com/rxwen/kicad-author.git}"
 KICAD_HAPPY_SKILLS="kicad emc spice datasheets bom lcsc jlcpcb pcbway"
 EASYEDA_INSTALL_URL="https://raw.githubusercontent.com/zhoushoujianwork/easyeda-agent/main/install.sh"
 FREEROUTING_REPO="freerouting/freerouting"
@@ -256,6 +257,45 @@ else
   fi
 fi
 
+# ── 6b. kicad-author 绘图技能（项目级，不装全局）────────────────────────────
+head1 "6b. kicad-author 绘图技能（项目级）"
+KA="$VENDOR/kicad-author"
+if [ "$SKIP_SKILLS" = 1 ]; then
+  warn "按参数跳过"
+elif [ "$DO_CHECK_ONLY" = 1 ]; then
+  if [ -e "$SKILLS/kicad-author" ]; then
+    ok "已链接"
+    "$PY3" "$SKILLS/kicad-author/scripts/kicad-author" env >/dev/null 2>&1 \
+      && ok "CLI 可运行" || bad "CLI 跑不起来"
+  else
+    bad "未安装"
+  fi
+else
+  # 允许用本地工作副本开发：KICAD_AUTHOR_SRC=/path/to/kicad-author
+  if [ -n "${KICAD_AUTHOR_SRC:-}" ] && [ -d "$KICAD_AUTHOR_SRC" ]; then
+    ( cd "$SKILLS" && rm -rf kicad-author && ln -s "$KICAD_AUTHOR_SRC" kicad-author )
+    ok "已链接本地副本 → $KICAD_AUTHOR_SRC"
+  else
+    if [ -d "$KA/.git" ]; then
+      (cd "$KA" && git pull --quiet --ff-only 2>/dev/null) && ok "kicad-author 已更新" || ok "kicad-author 已存在"
+    elif command -v git >/dev/null 2>&1 && git clone --depth 1 --quiet "$KICAD_AUTHOR_REPO" "$KA" 2>/dev/null; then
+      ok "kicad-author 已克隆 → .claude/vendor/kicad-author/"
+    else
+      bad "克隆失败（无 git / 无网络 / 仓库尚未推送）"
+      note "本地开发可用: KICAD_AUTHOR_SRC=/path/to/kicad-author bash tools/init-eda-env.sh"
+    fi
+    if [ -d "$KA/scripts" ]; then
+      ( cd "$SKILLS" && rm -rf kicad-author && { ln -s "../vendor/kicad-author" kicad-author 2>/dev/null \
+        || cp -R "$KA" kicad-author; } )
+      ok "项目级技能 kicad-author（由代码生成可读的原理图 / 网表黄金表门禁）"
+    fi
+  fi
+  if [ -e "$SKILLS/kicad-author" ]; then
+    "$PY3" "$SKILLS/kicad-author/tests/test_units.py" >/dev/null 2>&1 \
+      && ok "自带单元测试通过" || warn "单元测试未通过（功能可能受限）"
+  fi
+fi
+
 # ── 7. easyeda-agent（EasyEDA 侧）───────────────────────────────────────────
 head1 "7. easyeda-agent（EasyEDA 侧）"
 EASYEDA_BIN=""
@@ -314,6 +354,8 @@ if [ "$DO_CHECK_ONLY" = 0 ]; then
   grep -qxF '.claude/skills/kicad' "$GI" 2>/dev/null || {
     for s in $KICAD_HAPPY_SKILLS; do echo ".claude/skills/$s" >> "$GI"; done
   }
+  grep -qxF '.claude/skills/kicad-author' "$GI" 2>/dev/null \
+    || echo '.claude/skills/kicad-author' >> "$GI"
   ok ".gitignore 已排除 vendor 与由它派生的技能链接"
   note "换机器只需重跑本脚本，不必把 ~400MB 依赖提交进仓库"
 fi
@@ -328,6 +370,7 @@ st "easyeda2kicad"  "$(PYTHONPATH=$PYLIBS_DIR $PY3 -c 'import easyeda2kicad' 2>/
 st "JDK"            "$JAVA_BIN"     "$([ -n "$JAVA_BIN" ] && jdk_major "$JAVA_BIN" || echo "需 ≥$JDK_FEATURE")"
 st "Freerouting"    "$FR_JAR"       "自动布线"
 st "kicad-happy"    "$([ -e "$SKILLS/kicad" ] && echo y)" "只读审查技能（项目级）"
+st "kicad-author"    "$([ -e "$SKILLS/kicad-author" ] && echo y)" "原理图生成技能（项目级）"
 st "easyeda-agent"  "$EASYEDA_BIN"  "EasyEDA 侧 CLI（连接器需 GUI 内装）"
 
 printf '\n  占用: %s\n' "$(du -sh "$VENDOR" 2>/dev/null | cut -f1) （全部在 .claude/vendor/，删目录即卸载）"
