@@ -12,3 +12,4 @@
 .DS_Store
 .claude/skills/kicad-author
 __pycache__/
+.mcp.json

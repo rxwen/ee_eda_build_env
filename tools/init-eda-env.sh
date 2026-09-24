@@ -12,6 +12,8 @@
 #    bash tools/init-eda-env.sh              # 安装 + 校验
 #    bash tools/init-eda-env.sh --check      # 只校验，不改任何东西
 #    bash tools/init-eda-env.sh --skip-jdk --skip-freerouting
+#    bash tools/init-eda-env.sh --skip-kicad-mcp   # 不装 kicad-mcp-server
+#    bash tools/init-eda-env.sh --skip-konnect     # 不装 Konnect
 #    bash tools/init-eda-env.sh --help
 # ============================================================================
 set -uo pipefail
@@ -24,9 +26,14 @@ EASYEDA_INSTALL_URL="https://raw.githubusercontent.com/zhoushoujianwork/easyeda-
 FREEROUTING_REPO="freerouting/freerouting"
 JDK_FEATURE="25"          # Freerouting 2.4.x 需要的最低 JDK 主版本
 PYLIBS="easyeda2kicad"
+KICAD_MCP_REPO="https://github.com/mixelpixx/KiCAD-MCP-Server.git"
+KICAD_MCP_BRANCH="stable"
+NODE_FEATURE="22"        # 缺 Node 时下载的 LTS 主版本
+NODE_MIN="18"             # kicad-mcp-server 可接受的最低 Node 主版本
+KONNECT_REPO="mixelpixx/Konnect"
 
 # ── 选项 ────────────────────────────────────────────────────────────────────
-DO_CHECK_ONLY=0; SKIP_JDK=0; SKIP_FR=0; SKIP_EASYEDA=0; SKIP_SKILLS=0; SKIP_PY=0
+DO_CHECK_ONLY=0; SKIP_JDK=0; SKIP_FR=0; SKIP_EASYEDA=0; SKIP_SKILLS=0; SKIP_PY=0; SKIP_MCP=0; SKIP_KONNECT=0
 for a in "$@"; do case "$a" in
   --check)            DO_CHECK_ONLY=1 ;;
   --skip-jdk)         SKIP_JDK=1 ;;
@@ -34,7 +41,9 @@ for a in "$@"; do case "$a" in
   --skip-easyeda)     SKIP_EASYEDA=1 ;;
   --skip-kicad-skills) SKIP_SKILLS=1 ;;
   --skip-python)      SKIP_PY=1 ;;
-  -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --skip-kicad-mcp)   SKIP_MCP=1 ;;
+  --skip-konnect)     SKIP_KONNECT=1 ;;
+  -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) echo "未知参数: $a （--help 看用法）" >&2; exit 2 ;;
 esac; done
 
@@ -73,6 +82,24 @@ link_or_copy() { # link_or_copy <src> <dst>
   if ln -s "$1" "$2" 2>/dev/null; then return 0; fi
   cp -R "$(cd "$(dirname "$2")" && cd "$(dirname "$1")" 2>/dev/null; echo "$1")" "$2" 2>/dev/null \
     || cp -R "$VENDOR/${1#../vendor/}" "$2"
+}
+
+# .mcp.json：只增改指定服务器一项，保留其他服务器（本机绝对路径，故不入库）
+json_str() { local v="${1//\\/\\\\}"; printf '"%s"' "${v//\"/\\\"}"; }
+mcp_register() { # mcp_register <name> <entry-json>
+  local py="${PY3:-$KICAD_PY}"
+  [ -n "$py" ] || { bad "没有 python3，无法写 .mcp.json"; return 1; }
+  "$py" - "$REPO/.mcp.json" "$1" "$2" <<'PYEOF'
+import json, sys
+path, name, entry = sys.argv[1:]
+try:
+    cfg = json.load(open(path, encoding="utf-8"))
+except Exception:
+    cfg = {}
+cfg.setdefault("mcpServers", {})[name] = json.loads(entry)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False); f.write("\n")
+PYEOF
 }
 
 # ── 1. 平台识别 ─────────────────────────────────────────────────────────────
@@ -190,7 +217,7 @@ elif pick_java; then
 elif [ "$DO_CHECK_ONLY" = 1 ]; then
   bad "无 JDK ≥ $JDK_FEATURE"
 else
-  note "现有 JDK 版本不足（Freerouting 需 ≥ $JDK_FEATURE），绿色下载 Temurin…"
+  note "现有 JDK 版本不足（Freerouting 需 ≥ ${JDK_FEATURE}），绿色下载 Temurin…"
   mkdir -p "$VENDOR/jdk"
   URL="https://api.adoptium.net/v3/binary/latest/${JDK_FEATURE}/ga/${ADOPT_OS}/${ADOPT_ARCH}/jdk/hotspot/normal/eclipse"
   TGZ="$VENDOR/jdk/_jdk.tar.gz"
@@ -296,6 +323,186 @@ else
   fi
 fi
 
+# ── 6c. kicad-mcp-server（项目级 MCP，写 .mcp.json）────────────────────────
+head1 "6c. kicad-mcp-server（项目级 MCP）"
+KM="$VENDOR/kicad-mcp-server"
+NODE_BIN=""; KM_PY=""
+node_major() { "$1" -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/'; }
+pick_node() {
+  local c
+  for c in "$VENDOR"/node/node-*/bin/node "$VENDOR"/node/node-*/node.exe; do
+    [ -x "$c" ] && { NODE_BIN="$c"; return 0; }
+  done
+  command -v node >/dev/null 2>&1 && [ "$(node_major node)" -ge "$NODE_MIN" ] 2>/dev/null \
+    && { NODE_BIN="$(command -v node)"; return 0; }
+  return 1
+}
+# venv 里的解释器（Windows 布局不同）
+for c in "$KM/venv/bin/python3" "$KM/venv/Scripts/python.exe"; do [ -x "$c" ] && KM_PY="$c" && break; done
+
+if [ "$SKIP_MCP" = 1 ]; then
+  warn "按参数跳过"
+elif [ "$DO_CHECK_ONLY" = 1 ]; then
+  pick_node && ok "Node $(node_major "$NODE_BIN") — $NODE_BIN" || bad "无 Node ≥ $NODE_MIN"
+  [ -f "$KM/dist/index.js" ] && ok "已构建 $(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$KM/package.json" | head -1)" \
+    || bad "未安装或未构建"
+  [ -n "$KM_PY" ] && "$KM_PY" -c 'import pcbnew, skip' >/dev/null 2>&1 \
+    && ok "venv 可 import pcbnew / kicad-skip" || bad "venv 缺失或依赖不全"
+  grep -q '"kicad"' "$REPO/.mcp.json" 2>/dev/null && ok ".mcp.json 已注册 kicad" || bad ".mcp.json 未注册 kicad"
+elif [ -z "$KICAD_PY" ]; then
+  bad "没有带 pcbnew 的解释器（见第 2 步）—— 跳过 kicad-mcp-server"
+else
+  # Node：现有版本够用就用，否则绿色下载到 vendor/node
+  if ! pick_node; then
+    case "$OS" in mac) NODE_OS=darwin ;; linux) NODE_OS=linux ;; windows) NODE_OS=win ;; esac
+    EXT=tar.gz; [ "$OS" = windows ] && EXT=zip
+    NAME="$(fetch_stdout "https://nodejs.org/dist/latest-v${NODE_FEATURE}.x/SHASUMS256.txt" \
+            | awk '{print $2}' | grep -E "^node-v[0-9.]+-${NODE_OS}-${ARCH}\.${EXT}\$" | head -1)"
+    if [ -n "$NAME" ]; then
+      note "现有 Node 版本不足（需 ≥ ${NODE_MIN}），绿色下载 ${NAME}…"
+      mkdir -p "$VENDOR/node"; ARC="$VENDOR/node/$NAME"
+      if fetch "https://nodejs.org/dist/latest-v${NODE_FEATURE}.x/$NAME" "$ARC"; then
+        if [ "$EXT" = zip ]; then unzip -q "$ARC" -d "$VENDOR/node" 2>/dev/null
+        else tar xzf "$ARC" -C "$VENDOR/node" 2>/dev/null; fi
+        rm -f "$ARC"
+      fi
+    fi
+    pick_node && ok "Node $(node_major "$NODE_BIN") → .claude/vendor/node/" || bad "Node 下载失败（无网络？）"
+  else
+    ok "Node $(node_major "$NODE_BIN") — $NODE_BIN"
+  fi
+
+  # 源码：跟踪 stable 分支（只在发版时移动）
+  if [ -n "$NODE_BIN" ]; then
+    if [ -d "$KM/.git" ]; then
+      (cd "$KM" && git fetch --depth 1 --quiet origin "$KICAD_MCP_BRANCH" && git checkout --quiet FETCH_HEAD) 2>/dev/null \
+        && ok "kicad-mcp-server 已更新" || ok "kicad-mcp-server 已存在"
+    elif command -v git >/dev/null 2>&1 \
+         && git clone --depth 1 --quiet --branch "$KICAD_MCP_BRANCH" "$KICAD_MCP_REPO" "$KM" 2>/dev/null; then
+      ok "kicad-mcp-server 已克隆 → .claude/vendor/kicad-mcp-server/"
+    else
+      bad "克隆失败（无 git 或无网络）"
+    fi
+  fi
+
+  if [ -n "$NODE_BIN" ] && [ -f "$KM/package.json" ]; then
+    REV="$(cd "$KM" && git rev-parse HEAD 2>/dev/null)"
+    STAMP="$KM/.init-stamp"
+    # Python：用 KiCad 自带解释器建 venv（--system-site-packages 才能看到 pcbnew）
+    if [ -z "$KM_PY" ]; then
+      "$KICAD_PY" -m venv --system-site-packages "$KM/venv" >/dev/null 2>&1
+      for c in "$KM/venv/bin/python3" "$KM/venv/Scripts/python.exe"; do [ -x "$c" ] && KM_PY="$c" && break; done
+    fi
+    if [ -z "$KM_PY" ]; then
+      bad "venv 创建失败"
+    elif [ "$(cat "$STAMP" 2>/dev/null)" = "$REV" ] && [ -f "$KM/dist/index.js" ]; then
+      ok "依赖与构建已是最新（跳过）"
+    else
+      NPM_PATH="$(dirname "$NODE_BIN"):$PATH"   # 让 npm 用上面选定的 node
+      if "$KM_PY" -m pip install --quiet --disable-pip-version-check -r "$KM/requirements.txt" >/dev/null 2>&1 \
+         && (cd "$KM" && PATH="$NPM_PATH" npm ci --silent --no-audit --no-fund >/dev/null 2>&1 \
+                     && PATH="$NPM_PATH" npm run build --silent >/dev/null 2>&1); then
+        echo "$REV" > "$STAMP"; ok "Python 依赖 + npm 构建完成"
+      else
+        bad "安装/构建失败（无网络？可手工进 .claude/vendor/kicad-mcp-server 排查）"
+      fi
+    fi
+    if [ -n "$KM_PY" ]; then
+      "$KM_PY" -c 'import pcbnew, skip' >/dev/null 2>&1 \
+        && ok "venv 可 import pcbnew / kicad-skip" || bad "venv 里 import pcbnew 失败"
+    fi
+  fi
+
+  if [ -f "$KM/dist/index.js" ] && [ -n "$KM_PY" ]; then
+    KM_SITE="$("$KM_PY" -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')"
+    mcp_register kicad "{\"type\": \"stdio\", \"command\": $(json_str "$NODE_BIN"),
+      \"args\": [$(json_str "$KM/dist/index.js")],
+      \"env\": {\"KICAD_PYTHON\": $(json_str "$KM_PY"), \"PYTHONPATH\": $(json_str "$KM_SITE"), \"LOG_LEVEL\": \"info\"}}" \
+      && ok ".mcp.json 已注册 kicad（项目级）"
+    note "重启 Claude Code 后按提示批准项目服务器 kicad，/mcp 查看连接状态"
+  fi
+fi
+
+# ── 6d. Konnect（kicad-mcp-server 的 Rust 继任者，单二进制，需 KiCad 10）──────
+head1 "6d. Konnect（项目级 MCP，beta）"
+KN="$VENDOR/konnect"
+KN_BIN=""; for c in "$KN/konnect" "$KN/konnect.exe"; do [ -x "$c" ] && KN_BIN="$c" && break; done
+KN_CONF="$KN/konnect.toml"
+# 注意：konnect 在终端（TTY）里不带参数运行会执行全局安装（写 ~/.claude），
+#       所以这里只调用 --version；MCP 客户端经管道启动时才进入服务模式。
+kn_ver() { "$1" --version 2>/dev/null | sed -E 's/^[^0-9]*([0-9][0-9.]*).*/\1/'; }
+case "$OS/$ARCH" in
+  mac/arm64)   KN_TRIPLE=aarch64-apple-darwin ;;
+  mac/x64)     KN_TRIPLE=x86_64-apple-darwin ;;
+  linux/x64)   KN_TRIPLE=x86_64-unknown-linux-gnu ;;
+  windows/x64) KN_TRIPLE=x86_64-pc-windows-msvc ;;
+  *)           KN_TRIPLE="" ;;
+esac
+# Windows 原生二进制读不懂 /c/... 形式的路径
+native_path() { if [ "$OS" = windows ] && command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
+
+if [ "$SKIP_KONNECT" = 1 ]; then
+  warn "按参数跳过"
+elif [ "$DO_CHECK_ONLY" = 1 ]; then
+  [ -n "$KN_BIN" ] && ok "Konnect $(kn_ver "$KN_BIN")" || bad "未安装"
+  [ -f "$KN_CONF" ] && ok "配置 .claude/vendor/konnect/konnect.toml" || bad "缺少 konnect.toml"
+  grep -q '"konnect"' "$REPO/.mcp.json" 2>/dev/null && ok ".mcp.json 已注册 konnect" || bad ".mcp.json 未注册 konnect"
+elif [ -z "$KN_TRIPLE" ]; then
+  warn "Konnect 没有 $OS/$ARCH 的发布包 —— 跳过（可自行 cargo build）"
+else
+  case "${KICAD_VER:-}" in 10.*|1[1-9].*) ;; *) warn "Konnect 需要 KiCad 10（当前：${KICAD_VER:-未安装}），仍安装但 PCB 工具不可用" ;; esac
+  TAG="$(fetch_stdout "https://api.github.com/repos/$KONNECT_REPO/releases/latest" \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+  if [ -z "$TAG" ]; then
+    [ -n "$KN_BIN" ] && warn "取不到最新版本号，沿用已装的 $(kn_ver "$KN_BIN")" || bad "取不到 Konnect 最新版本号（无网络？）"
+  elif [ -n "$KN_BIN" ] && [ "$(kn_ver "$KN_BIN")" = "${TAG#v}" ]; then
+    ok "Konnect ${TAG#v} 已是最新（跳过）"
+  else
+    EXT=tar.gz; [ "$OS" = windows ] && EXT=zip
+    NAME="konnect-${TAG}-${KN_TRIPLE}.${EXT}"
+    mkdir -p "$KN"; ARC="$KN/_$NAME"; TMPX="$KN/_extract"
+    rm -rf "$TMPX"; mkdir -p "$TMPX"
+    if fetch "https://github.com/$KONNECT_REPO/releases/download/$TAG/$NAME" "$ARC"; then
+      if [ "$EXT" = zip ]; then unzip -q "$ARC" -d "$TMPX" 2>/dev/null; else tar xzf "$ARC" -C "$TMPX" 2>/dev/null; fi
+      NEW="$(find "$TMPX" -type f \( -name konnect -o -name konnect.exe \) | head -1)"
+      if [ -n "$NEW" ]; then
+        rm -f "$KN/konnect" "$KN/konnect.exe"; mv "$NEW" "$KN/"; chmod +x "$KN"/konnect* 2>/dev/null
+        [ "$OS" = mac ] && xattr -d com.apple.quarantine "$KN/konnect" 2>/dev/null
+        for c in "$KN/konnect" "$KN/konnect.exe"; do [ -x "$c" ] && KN_BIN="$c" && break; done
+        ok "Konnect ${TAG#v} → .claude/vendor/konnect/"
+      else
+        bad "解包后找不到 konnect 二进制"
+      fi
+    else
+      bad "下载 $NAME 失败（无网络？可用 --skip-konnect 跳过）"
+    fi
+    rm -rf "$ARC" "$TMPX"
+  fi
+
+  if [ -n "$KN_BIN" ]; then
+    # 显式配置文件（--config 跳过它的搜索链，不读 ~/Library、~/.config）；
+    # JLCPCB 离线库默认在 ~/.konnect/，这里改到 vendor 内以保持绿色安装
+    KICAD_GUI=""
+    for c in "$(dirname "${KICAD_CLI:-/nonexistent}")/kicad" "$(dirname "${KICAD_CLI:-/nonexistent}")/kicad.exe"; do
+      [ -x "$c" ] && KICAD_GUI="$c" && break
+    done
+    {
+      echo "# 由 tools/init-eda-env.sh 生成，勿手改（重跑脚本会覆盖）"
+      [ -n "$KICAD_CLI" ] && echo "kicad_cli = '$(native_path "$KICAD_CLI")'"
+      [ -n "$KICAD_GUI" ] && echo "kicad_binary = '$(native_path "$KICAD_GUI")'"
+      echo "jlcpcb_db_path = '$(native_path "$KN/jlcpcb.db")'"
+      echo "log_level = 'info'"
+      echo "# ipc_address 留空：按 KICAD_API_SOCKET / 平台默认 socket 自动解析"
+    } > "$KN_CONF"
+    ok "配置 → .claude/vendor/konnect/konnect.toml"
+    mcp_register konnect "{\"type\": \"stdio\", \"command\": $(json_str "$(native_path "$KN_BIN")"),
+      \"args\": [\"--config\", $(json_str "$(native_path "$KN_CONF")")]}" \
+      && ok ".mcp.json 已注册 konnect（项目级）"
+    note "PCB 工具需 KiCad 10 开着目标板，并勾选 Preferences → Plugins → Enable KiCad API"
+    note "不要运行 'konnect init'：它会往全局 ~/.claude 装技能/agent/hook"
+  fi
+fi
+
 # ── 7. easyeda-agent（EasyEDA 侧）───────────────────────────────────────────
 head1 "7. easyeda-agent（EasyEDA 侧）"
 EASYEDA_BIN=""
@@ -342,6 +549,9 @@ if [ "$DO_CHECK_ONLY" = 0 ]; then
     echo "JAVA_BIN=\"${JAVA_BIN}\""
     echo "FREEROUTING_JAR=\"${FR_JAR}\""
     echo "EASYEDA_BIN=\"${EASYEDA_BIN}\""
+    echo "NODE_BIN=\"${NODE_BIN}\""
+    echo "KICAD_MCP_PY=\"${KM_PY}\""
+    echo "KONNECT_BIN=\"${KN_BIN}\""
     echo "PYLIBS_DIR=\"$PYLIBS_DIR\""
     echo "export PYTHONPATH=\"\$PYLIBS_DIR\${PYTHONPATH:+:\$PYTHONPATH}\""
   } > "$ENVFILE"
@@ -356,7 +566,8 @@ if [ "$DO_CHECK_ONLY" = 0 ]; then
   }
   grep -qxF '.claude/skills/kicad-author' "$GI" 2>/dev/null \
     || echo '.claude/skills/kicad-author' >> "$GI"
-  ok ".gitignore 已排除 vendor 与由它派生的技能链接"
+  grep -qxF '.mcp.json' "$GI" 2>/dev/null || echo '.mcp.json' >> "$GI"
+  ok ".gitignore 已排除 vendor、派生的技能链接与本机 .mcp.json"
   note "换机器只需重跑本脚本，不必把 ~400MB 依赖提交进仓库"
 fi
 
@@ -371,6 +582,8 @@ st "JDK"            "$JAVA_BIN"     "$([ -n "$JAVA_BIN" ] && jdk_major "$JAVA_BI
 st "Freerouting"    "$FR_JAR"       "自动布线"
 st "kicad-happy"    "$([ -e "$SKILLS/kicad" ] && echo y)" "只读审查技能（项目级）"
 st "kicad-author"    "$([ -e "$SKILLS/kicad-author" ] && echo y)" "原理图生成技能（项目级）"
+st "kicad-mcp-server" "$([ -f "$KM/dist/index.js" ] && grep -q '"kicad"' "$REPO/.mcp.json" 2>/dev/null && echo y)" "KiCad MCP（.mcp.json 项目级）"
+st "Konnect"        "$([ -n "$KN_BIN" ] && grep -q '"konnect"' "$REPO/.mcp.json" 2>/dev/null && echo y)" "KiCad 10 MCP（beta，.mcp.json 项目级）"
 st "easyeda-agent"  "$EASYEDA_BIN"  "EasyEDA 侧 CLI（连接器需 GUI 内装）"
 
 printf '\n  占用: %s\n' "$(du -sh "$VENDOR" 2>/dev/null | cut -f1) （全部在 .claude/vendor/，删目录即卸载）"
