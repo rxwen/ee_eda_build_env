@@ -3,8 +3,8 @@
 #  init-eda-env.sh —— 把当前仓库初始化为「EasyEDA + KiCad」AI 辅助设计环境
 #
 #  绿色安装：除 KiCad 本体（GUI 应用）外，一切装在仓库内的 .claude/vendor/，
-#  不碰 ~/.claude、不碰系统 pip、不用 /plugin（那是全局的）。
-#  删掉 .claude/vendor/ 即可完全卸载。
+#  Claude / Codex 共用依赖与技能，不碰 ~/.claude、~/.codex、~/.agents。
+#  MCP 分别生成项目 .mcp.json 与 .codex/config.toml。
 #
 #  跨平台：macOS / Linux / Windows(Git Bash、WSL)
 #
@@ -14,6 +14,7 @@
 #    bash tools/init-eda-env.sh --skip-jdk --skip-freerouting
 #    bash tools/init-eda-env.sh --skip-kicad-mcp   # 不装 kicad-mcp-server
 #    bash tools/init-eda-env.sh --skip-konnect     # 不装 Konnect
+#    bash tools/init-eda-env.sh --sync-config-only # 仅同步现有配置到 Codex
 #    bash tools/init-eda-env.sh --help
 # ============================================================================
 set -uo pipefail
@@ -34,8 +35,10 @@ KONNECT_REPO="mixelpixx/Konnect"
 
 # ── 选项 ────────────────────────────────────────────────────────────────────
 DO_CHECK_ONLY=0; SKIP_JDK=0; SKIP_FR=0; SKIP_EASYEDA=0; SKIP_SKILLS=0; SKIP_PY=0; SKIP_MCP=0; SKIP_KONNECT=0
+SYNC_CONFIG_ONLY=0
 for a in "$@"; do case "$a" in
   --check)            DO_CHECK_ONLY=1 ;;
+  --sync-config-only) SYNC_CONFIG_ONLY=1 ;;
   --skip-jdk)         SKIP_JDK=1 ;;
   --skip-freerouting) SKIP_FR=1; SKIP_JDK=1 ;;
   --skip-easyeda)     SKIP_EASYEDA=1 ;;
@@ -43,7 +46,7 @@ for a in "$@"; do case "$a" in
   --skip-python)      SKIP_PY=1 ;;
   --skip-kicad-mcp)   SKIP_MCP=1 ;;
   --skip-konnect)     SKIP_KONNECT=1 ;;
-  -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) echo "未知参数: $a （--help 看用法）" >&2; exit 2 ;;
 esac; done
 
@@ -63,6 +66,20 @@ REPO="$(cd "$(dirname "$(abspath "$0")")/.." && pwd -P)"
 VENDOR="$REPO/.claude/vendor"
 SKILLS="$REPO/.claude/skills"
 ENVFILE="$VENDOR/tools.env"
+
+sync_codex() {
+  local py="${PY3:-$(command -v python3 || command -v python || true)}"
+  [ -n "$py" ] || { bad "需要 Python >= 3.11 同步 Codex 项目配置"; return 1; }
+  if [ "$DO_CHECK_ONLY" = 1 ]; then
+    "$py" "$REPO/tools/sync-codex.py" --check
+  else
+    "$py" "$REPO/tools/sync-codex.py"
+  fi
+}
+if [ "$SYNC_CONFIG_ONLY" = 1 ]; then
+  sync_codex
+  exit $?
+fi
 
 # 下载器：curl 优先，退回 wget
 fetch() { # fetch <url> <dest>
@@ -94,7 +111,7 @@ import json, sys
 path, name, entry = sys.argv[1:]
 try:
     cfg = json.load(open(path, encoding="utf-8"))
-except Exception:
+except FileNotFoundError:
     cfg = {}
 cfg.setdefault("mcpServers", {})[name] = json.loads(entry)
 with open(path, "w", encoding="utf-8") as f:
@@ -536,6 +553,12 @@ fi
 [ -d "$SKILLS/easyeda-agent" ] && ok "easyeda-agent 技能已在项目内" \
   || warn "未见 .claude/skills/easyeda-agent —— EasyEDA 侧技能需另行放置"
 
+# Claude 的安装目录和 .mcp.json 是共享来源；Codex 只生成客户端入口。
+head1 "7b. Codex（项目级 MCP + 共享 skills）"
+CODEX_STATUS=0
+sync_codex || CODEX_STATUS=$?
+note "Codex 需信任当前项目才会读取 .codex/config.toml；重启会话后用 /mcp 检查连接"
+
 # ── 8. 写 tools.env ─────────────────────────────────────────────────────────
 if [ "$DO_CHECK_ONLY" = 0 ]; then
   head1 "8. 生成 tools.env"
@@ -567,7 +590,9 @@ if [ "$DO_CHECK_ONLY" = 0 ]; then
   grep -qxF '.claude/skills/kicad-author' "$GI" 2>/dev/null \
     || echo '.claude/skills/kicad-author' >> "$GI"
   grep -qxF '.mcp.json' "$GI" 2>/dev/null || echo '.mcp.json' >> "$GI"
-  ok ".gitignore 已排除 vendor、派生的技能链接与本机 .mcp.json"
+  grep -qxF '.codex/config.toml' "$GI" 2>/dev/null || echo '.codex/config.toml' >> "$GI"
+  grep -qxF '.agents/skills/' "$GI" 2>/dev/null || echo '.agents/skills/' >> "$GI"
+  ok ".gitignore 已排除 vendor、派生的技能链接与本机 MCP 配置"
   note "换机器只需重跑本脚本，不必把 ~400MB 依赖提交进仓库"
 fi
 
@@ -590,3 +615,4 @@ printf '\n  占用: %s\n' "$(du -sh "$VENDOR" 2>/dev/null | cut -f1) （全部�
 if [ "$DO_CHECK_ONLY" = 0 ]; then
   printf '  下一步: %s\n' "bash tools/init-eda-env.sh --check   # 随时复核"
 fi
+exit "$CODEX_STATUS"
